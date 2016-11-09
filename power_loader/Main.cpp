@@ -4,14 +4,27 @@
 #include <vector>
 #include <cstring>
 #include <codecvt>
+#include <sstream>
 
 using namespace std;
 
 typedef BOOL(WINAPI *DllEntryProc)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 
-static IMAGE_NT_HEADERS ntHeader;
+class Module
+{
+public:
+    Module(wstring dllPath);
+    ~Module();
+    
+    FARPROC GetProcAddress(string name);
 
-HMODULE Go(wstring dllPath)
+private:
+    HMODULE module_;
+    IMAGE_NT_HEADERS ntHeader_;
+    string error_;
+};
+
+Module::Module(wstring dllPath)
 {
     SYSTEM_INFO systemInfo;
     ::GetSystemInfo(&systemInfo);
@@ -26,15 +39,15 @@ HMODULE Go(wstring dllPath)
 
     f.read(reinterpret_cast<char *>(&dosHeader), sizeof(dosHeader));
     f.seekg(dosHeader.e_lfanew, ifstream::beg);
-    f.read(reinterpret_cast<char *>(&ntHeader), sizeof(ntHeader));
+    f.read(reinterpret_cast<char *>(&ntHeader_), sizeof(ntHeader_));
 
-    vector<IMAGE_SECTION_HEADER> sections(ntHeader.FileHeader.NumberOfSections);
+    vector<IMAGE_SECTION_HEADER> sections(ntHeader_.FileHeader.NumberOfSections);
 
-    f.read(reinterpret_cast<char *>(&sections[0]), sizeof(IMAGE_SECTION_HEADER) * ntHeader.FileHeader.NumberOfSections);
+    f.read(reinterpret_cast<char *>(&sections[0]), sizeof(IMAGE_SECTION_HEADER) * ntHeader_.FileHeader.NumberOfSections);
 
     // Allocate memory
     LPVOID preferredBase = nullptr; //reinterpret_cast<LPVOID>(ntHeader.OptionalHeader.ImageBase);
-    auto buffer = ::VirtualAlloc(preferredBase, ntHeader.OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    auto buffer = ::VirtualAlloc(preferredBase, ntHeader_.OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     DWORD baseAddress = reinterpret_cast<DWORD>(buffer);
 
     // Copy sections into memory
@@ -46,9 +59,9 @@ HMODULE Go(wstring dllPath)
         if (size == 0)
         {
             if (section.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA)
-                size = ntHeader.OptionalHeader.SizeOfUninitializedData;
+                size = ntHeader_.OptionalHeader.SizeOfUninitializedData;
             else if (section.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA)
-                size = ntHeader.OptionalHeader.SizeOfInitializedData;
+                size = ntHeader_.OptionalHeader.SizeOfInitializedData;
         }
 
         f.read(reinterpret_cast<char *>(baseAddress) + section.VirtualAddress, size);
@@ -58,7 +71,7 @@ HMODULE Go(wstring dllPath)
     f.close();
 
     // Process import table
-    IMAGE_DATA_DIRECTORY importTable = ntHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    IMAGE_DATA_DIRECTORY importTable = ntHeader_.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     unsigned int importOffset = baseAddress + importTable.VirtualAddress;
     unsigned int importEnd = baseAddress + importTable.VirtualAddress + importTable.Size;
 
@@ -99,8 +112,8 @@ HMODULE Go(wstring dllPath)
     }
 
     // Load and process relocation table
-    auto relocationValue = static_cast<int32_t>(baseAddress - ntHeader.OptionalHeader.ImageBase);
-    IMAGE_DATA_DIRECTORY relocationTable = ntHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    auto relocationValue = static_cast<int32_t>(baseAddress - ntHeader_.OptionalHeader.ImageBase);
+    IMAGE_DATA_DIRECTORY relocationTable = ntHeader_.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
     unsigned int endOfRelocation = baseAddress + relocationTable.VirtualAddress + relocationTable.Size;
     unsigned int offset = baseAddress + relocationTable.VirtualAddress;
@@ -147,9 +160,9 @@ HMODULE Go(wstring dllPath)
         if (size == 0)
         {
             if (section.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA)
-                size = ntHeader.OptionalHeader.SizeOfUninitializedData;
+                size = ntHeader_.OptionalHeader.SizeOfUninitializedData;
             else if (section.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA)
-                size = ntHeader.OptionalHeader.SizeOfInitializedData;
+                size = ntHeader_.OptionalHeader.SizeOfInitializedData;
         }
 
         if (size == 0)
@@ -160,33 +173,40 @@ HMODULE Go(wstring dllPath)
         if (result == 0)
         {
             auto boo = ::GetLastError();
-            return 0;
+            ostringstream ss;
+            ss << "Shit's broke, yo: " << boo;
+            error_ = ss.str();
+            return;
         }
     }
 
     // Call DllMain
-    DllEntryProc entry = reinterpret_cast<DllEntryProc>(baseAddress + ntHeader.OptionalHeader.AddressOfEntryPoint);
+    DllEntryProc entry = reinterpret_cast<DllEntryProc>(baseAddress + ntHeader_.OptionalHeader.AddressOfEntryPoint);
     (*entry)(reinterpret_cast<HINSTANCE>(baseAddress), DLL_PROCESS_ATTACH, 0);
 
     // Yay!
-    return reinterpret_cast<HMODULE>(baseAddress);
+    module_ = reinterpret_cast<HMODULE>(baseAddress);
 }
 
-FARPROC FudgedGetProcAddress(HMODULE module, LPCSTR name)
+Module::~Module()
 {
-    DWORD baseAddress = reinterpret_cast<DWORD>(module);
-    IMAGE_DATA_DIRECTORY exportTable = ntHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    // Going to need a FreeLibrary equivalent in here ...
+}
+
+FARPROC Module::GetProcAddress(string name)
+{
+    DWORD baseAddress = reinterpret_cast<DWORD>(module_);
+    IMAGE_DATA_DIRECTORY exportTable = ntHeader_.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     IMAGE_EXPORT_DIRECTORY *e = reinterpret_cast<IMAGE_EXPORT_DIRECTORY *>(baseAddress + exportTable.VirtualAddress);
 
     // Resolve functions
     DWORD *names = reinterpret_cast<DWORD *>(baseAddress + e->AddressOfNames);
     WORD *ordinals = reinterpret_cast<WORD *>(baseAddress + e->AddressOfNameOrdinals);
 
-    string targetName(name);
     while (*names)
     {
         string currentName(reinterpret_cast<char *>(baseAddress + *names));
-        if (targetName == currentName)
+        if (name == currentName)
         {
             break;
         }
@@ -206,18 +226,17 @@ typedef bool(*CompareProc)(string foo, string bar);
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prevInstance, LPSTR commandLine, int show)
 {
-    //HMODULE dll = Go(L"c:\\OpenSSL-Win32\\libssl32.dll");
-    HMODULE dll = Go(L"dll_test.dll");
+    Module dll(L"dll_test.dll");
 
     int result = -1;
-    AddProc add = reinterpret_cast<AddProc>(::FudgedGetProcAddress(dll, "Add"));
+    AddProc add = reinterpret_cast<AddProc>(dll.GetProcAddress("Add"));
     if (add)
         result = (*add)(4, 9);
 
     cout << result << endl;
 
     bool comp = false;
-    CompareProc compare = reinterpret_cast<CompareProc>(::FudgedGetProcAddress(dll, "Compare"));
+    CompareProc compare = reinterpret_cast<CompareProc>(dll.GetProcAddress("Compare"));
     if (compare)
         comp = (*compare)("test111", "test111");
 
